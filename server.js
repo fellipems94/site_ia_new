@@ -7,29 +7,39 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 // ===== Inicialização =====
-dotenv.config();
+dotenv.config(); // agora lê .env
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '1mb' })); // evita payloads exagerados
 
-// CORS (habilite quando o front NÃO estiver no mesmo domínio do back)
-// No seu caso: CORS_ORIGIN=https://supplementsreviews.blog
-const allowOrigin = process.env.CORS_ORIGIN || null;
-if (allowOrigin) {
-  app.use(cors({ origin: allowOrigin, methods: ['POST', 'GET', 'OPTIONS'] }));
+// ===== CORS =====
+// Use CORS_ORIGIN no .env (pode ser 1 origem ou lista separada por vírgula)
+const rawOrigins = (process.env.CORS_ORIGIN || '').trim();
+if (rawOrigins) {
+  const allowed = rawOrigins.split(',').map(s => s.trim()).filter(Boolean);
+  app.use(
+    cors({
+      origin: (origin, cb) => {
+        // Permite chamadas de ferramentas/health sem Origin e as origens na lista
+        if (!origin || allowed.includes(origin)) return cb(null, true);
+        return cb(new Error('Not allowed by CORS'));
+      },
+      methods: ['POST', 'GET', 'OPTIONS'],
+    })
+  );
   app.options('*', cors());
 }
 
-// Static para servir sua página da pasta /public (opcional)
+// ===== Static (opcional, caso queira servir /public) =====
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ===== Config OpenAI (sempre via .env; nunca hardcode) =====
-const apiKey = process.env.OPENAI_API_KEY;
+const apiKey = process.env.OPENAI_API_KEY; // (não exponha no cliente)
 const MODEL_JSON = process.env.OPENAI_MODEL_JSON || 'gpt-4o-mini';
 const MODEL_TEXT = process.env.OPENAI_MODEL_TEXT || 'gpt-4o-mini';
 if (!apiKey) {
-  console.warn('⚠️  OPENAI_API_KEY não definido. Configure no .env');
+  console.warn('⚠️  OPENAI_API_KEY não definido. Configure no .env ou no painel do Render.');
 }
 
 // ===== Helpers =====
@@ -167,7 +177,6 @@ async function chamarLLMJson(prompt) {
   const content = data?.choices?.[0]?.message?.content;
   if (!content) throw new Error('LLM sem conteúdo');
 
-  // Garante JSON válido (fallback: tenta extrair o último bloco { ... })
   try {
     return JSON.parse(content);
   } catch {
@@ -211,11 +220,11 @@ app.post('/api/ai-fill', async (req, res) => {
 
     const payload = await chamarLLMJson(promptFill(etapa1, limits));
     const safe = enforceLimits(payload, limits);
-    // text/plain evita problemas com proxies que mexem no JSON
+    // text/plain evita proxies que mexem no JSON
     res.type('text/plain').send(JSON.stringify(safe));
   } catch (err) {
     console.error('AI_FILL_FAIL:', err.message);
-    res.status(500).json({ error: 'AI_FILL_FAIL' });
+    res.status(500).json({ error: 'AI_FILL_FAIL', detail: err.message });
   }
 });
 
@@ -225,7 +234,6 @@ app.post('/api/ai-variant', async (req, res) => {
     if (!etapa1?.productName) return res.status(400).json({ error: 'FALTAM_DADOS', field: 'productName' });
 
     const text = await chamarLLMText(promptVariant(etapa1, kind, index, limits));
-    // Trunca no servidor (dupla proteção)
     const maxByKind = {
       title: limits?.titles?.max ?? 30,
       description: limits?.descriptions?.max ?? 90,
@@ -238,12 +246,19 @@ app.post('/api/ai-variant', async (req, res) => {
     res.type('text/plain').send(trunc(text, maxByKind));
   } catch (err) {
     console.error('AI_VARIANT_FAIL:', err.message);
-    res.status(500).json({ error: 'AI_VARIANT_FAIL' });
+    res.status(500).json({ error: 'AI_VARIANT_FAIL', detail: err.message });
   }
 });
 
-// Healthcheck simples (útil no Render)
-app.get('/health', (_req, res) => res.json({ ok: true }));
+// ===== Healthcheck =====
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    model_json: MODEL_JSON,
+    model_text: MODEL_TEXT,
+    cors_enabled: Boolean(rawOrigins),
+  });
+});
 
 // ===== Start =====
 const PORT = process.env.PORT || 3000;
