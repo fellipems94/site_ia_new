@@ -1,28 +1,36 @@
 // server.js
-// Requisitos: Node 18+ (tem fetch nativo)
+// Requisitos: Node 18+ (fetch nativo)
 import express from 'express';
+import dotenv from 'dotenv';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 // ===== Inicialização =====
+dotenv.config();
 const app = express();
 app.use(express.json());
 
-// CORS (se for servir o HTML de outro domínio). 
-// Se não precisar, pode remover.
-const allowOrigin = null;
+// CORS (habilite quando o front NÃO estiver no mesmo domínio do back)
+// No seu caso: CORS_ORIGIN=https://supplementsreviews.blog
+const allowOrigin = process.env.CORS_ORIGIN || null;
 if (allowOrigin) {
-  app.use(cors({ origin: allowOrigin, methods: ['POST', 'GET'], credentials: false }));
+  app.use(cors({ origin: allowOrigin, methods: ['POST', 'GET', 'OPTIONS'] }));
+  app.options('*', cors());
 }
 
-// Static para servir sua página da pasta /public
+// Static para servir sua página da pasta /public (opcional)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ===== SUA CHAVE DIRETO AQUI (⚠️ inseguro, use só local/teste) =====
-const apiKey = "S9MRT80WWWctDBRGliuV6w0gzb8s4qYbVqeY4U5Gif3KnyOJEQLLXs-fhgy2d96ULK4HrqlVZ6T3BlbkFJQyTlNxnlJZTW_7ZDVS0RAgkdNqM_1Pmu5Xc1ybsGhMK6vEjmDYvzVj7faD-GpeY2khILCwyGgA";
+// ===== Config OpenAI (sempre via .env; nunca hardcode) =====
+const apiKey = process.env.OPENAI_API_KEY;
+const MODEL_JSON = process.env.OPENAI_MODEL_JSON || 'gpt-4o-mini';
+const MODEL_TEXT = process.env.OPENAI_MODEL_TEXT || 'gpt-4o-mini';
+if (!apiKey) {
+  console.warn('⚠️  OPENAI_API_KEY não definido. Configure no .env');
+}
 
 // ===== Helpers =====
 function trunc(s, n) {
@@ -80,70 +88,102 @@ Você é um redator especializado em Google Ads (2025), com foco em localizaçã
 OBJETIVO:
 Gerar ativos de anúncio (títulos, descrições, sitelinks e frases destaque) para o produto abaixo, no padrão de vendas do país e idioma informados. Textos criativos, claros, persuasivos e alinhados ao estilo Google Ads (sem apelação).
 
-REGRAS:
-- Apenas JSON válido.
-- Idioma: ${language} (${country}).
-- Respeite limites de caracteres (títulos ≤30, descrições ≤90, etc).
-- Use preço e descontos se fizer sentido:
-  • Preço: ${productCurrency} ${productValue}
-  • Desconto: ${discountCurrency} ${monetaryDiscount} / ${percentageDiscount}%
-- Estilo Google Ads: benefício + valor + CTA moderado.
+REGRAS GERAIS (SIGA À RISCA):
+- Responda SOMENTE com um JSON VÁLIDO, sem texto antes ou depois.
+- Idioma de saída: ${language} (variante local de ${country}).
+- Adapte tom e vocabulário ao país/idioma.
+- Conformidade: políticas Google Ads 2025; evite promessas absolutas/enganosas; sem emojis; no máx. 1 "!" por item.
+- Estilo Google Ads: benefício + proposta de valor + CTA moderado.
+- Use preço/descontos quando fizer sentido:
+  • Preço: ${productCurrency} ${productValue ?? 'n/a'}
+  • Desconto monetário: ${discountCurrency} ${monetaryDiscount ?? 'n/a'}
+  • Desconto percentual: ${percentageDiscount ?? 'n/a'}%
+- Varie os textos entre si e respeite exatamente os limites de caracteres.
 
-FORMATO DE SAÍDA (JSON):
+LIMITES:
+- titles: ${limits?.titles?.count ?? 15} itens, cada um ≤ ${limits?.titles?.max ?? 30} caracteres.
+- descriptions: ${limits?.descriptions?.count ?? 4} itens, cada um ≤ ${limits?.descriptions?.max ?? 90} caracteres.
+- sitelinks (${limits?.sitelinks?.count ?? 4} itens): text ≤ ${limits?.sitelinks?.text ?? 25}, desc1 ≤ ${limits?.sitelinks?.desc1 ?? 35}, desc2 ≤ ${limits?.sitelinks?.desc2 ?? 35}.
+- highlights: ${limits?.highlights?.count ?? 8} itens, cada um ≤ ${limits?.highlights?.max ?? 25} caracteres.
+
+FORMATO DE SAÍDA (JSON EXATO):
 {
-  "titles": string[15],
-  "descriptions": string[4],
-  "sitelinks": { "text": string, "desc1": string, "desc2": string }[4],
-  "highlights": string[8]
+  "titles": string[${limits?.titles?.count ?? 15}],
+  "descriptions": string[${limits?.descriptions?.count ?? 4}],
+  "sitelinks": { "text": string, "desc1": string, "desc2": string }[${limits?.sitelinks?.count ?? 4}],
+  "highlights": string[${limits?.highlights?.count ?? 8}]
 }
 
-DADOS:
+DADOS DO PRODUTO (ENTRADA):
 ${JSON.stringify(etapa1, null, 2)}
 `.trim();
 }
 
 function promptVariant(etapa1, kind, index, limits) {
-  return `
-Gere apenas 1 variação para "${kind}" (índice ${index}) respeitando o limite de caracteres.
-Produto: ${etapa1?.productName}
-País: ${etapa1?.country} | Idioma: ${etapa1?.language}
-Desconto: ${etapa1?.discountCurrency} ${etapa1?.monetaryDiscount} / ${etapa1?.percentageDiscount}%
+  const limit = {
+    title: limits?.titles?.max ?? 30,
+    description: limits?.descriptions?.max ?? 90,
+    sitelink_text: limits?.sitelinks?.text ?? 25,
+    sitelink_desc1: limits?.sitelinks?.desc1 ?? 35,
+    sitelink_desc2: limits?.sitelinks?.desc2 ?? 35,
+    highlight: limits?.highlights?.max ?? 25
+  }[kind] || 90;
 
-Saída: apenas o texto final.
+  return `
+Você é um redator de Google Ads (2025). Gere APENAS UMA variação para "${kind}" (índice ${index}):
+- País: ${etapa1?.country} | Idioma: ${etapa1?.language}
+- Limite: ≤ ${limit} caracteres
+- Estilo: benefício + valor + CTA moderado; sem violar políticas Google Ads 2025; sem emojis; no máx. 1 "!"
+- Considere preço/descontos quando fizer sentido (${etapa1?.productCurrency} ${etapa1?.productValue}; ${etapa1?.discountCurrency} ${etapa1?.monetaryDiscount} / ${etapa1?.percentageDiscount}%)
+
+Saída: SOMENTE o texto final (sem aspas e sem JSON).
+Produto: ${etapa1?.productName}
 `.trim();
 }
 
 // ===== Chamada OpenAI =====
 async function chamarLLMJson(prompt) {
+  if (!apiKey) throw new Error('OPENAI_API_KEY ausente');
   const r = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    },
+    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'gpt-4o-mini',
+      model: MODEL_JSON,
       temperature: 0.3,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: 'Responda apenas em JSON válido.' },
+        { role: 'system', content: 'Responda sempre de forma objetiva, conforme políticas Google Ads 2025.' },
         { role: 'user', content: prompt }
       ]
     })
   });
+
+  if (!r.ok) {
+    const errTxt = await r.text().catch(() => '');
+    throw new Error(`OpenAI erro: ${r.status} ${errTxt}`);
+  }
+
   const data = await r.json();
-  return data?.choices?.[0]?.message?.content;
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content) throw new Error('LLM sem conteúdo');
+
+  // Garante JSON válido (fallback: tenta extrair o último bloco { ... })
+  try {
+    return JSON.parse(content);
+  } catch {
+    const match = content.match(/\{[\s\S]*\}$/);
+    if (!match) throw new Error('Resposta da IA não é JSON válido');
+    return JSON.parse(match[0]);
+  }
 }
 
 async function chamarLLMText(prompt) {
+  if (!apiKey) throw new Error('OPENAI_API_KEY ausente');
   const r = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    },
+    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'gpt-4o-mini',
+      model: MODEL_TEXT,
       temperature: 0.5,
       messages: [
         { role: 'system', content: 'Responda apenas com o texto pedido, sem aspas.' },
@@ -151,20 +191,30 @@ async function chamarLLMText(prompt) {
       ]
     })
   });
+
+  if (!r.ok) {
+    const errTxt = await r.text().catch(() => '');
+    throw new Error(`OpenAI erro: ${r.status} ${errTxt}`);
+  }
+
   const data = await r.json();
-  return data?.choices?.[0]?.message?.content?.trim();
+  const content = data?.choices?.[0]?.message?.content?.trim();
+  if (!content) throw new Error('LLM sem conteúdo');
+  return content;
 }
 
 // ===== Endpoints =====
 app.post('/api/ai-fill', async (req, res) => {
   try {
     const { etapa1, limits } = req.body || {};
-    const prompt = promptFill(etapa1, limits);
-    const jsonStr = await chamarLLMJson(prompt);
-    const payload = JSON.parse(jsonStr);
-    res.json(enforceLimits(payload, limits));
+    if (!etapa1?.productName) return res.status(400).json({ error: 'FALTAM_DADOS', field: 'productName' });
+
+    const payload = await chamarLLMJson(promptFill(etapa1, limits));
+    const safe = enforceLimits(payload, limits);
+    // text/plain evita problemas com proxies que mexem no JSON
+    res.type('text/plain').send(JSON.stringify(safe));
   } catch (err) {
-    console.error(err);
+    console.error('AI_FILL_FAIL:', err.message);
     res.status(500).json({ error: 'AI_FILL_FAIL' });
   }
 });
@@ -172,17 +222,31 @@ app.post('/api/ai-fill', async (req, res) => {
 app.post('/api/ai-variant', async (req, res) => {
   try {
     const { etapa1, kind, index, limits } = req.body || {};
-    const prompt = promptVariant(etapa1, kind, index, limits);
-    const text = await chamarLLMText(prompt);
-    res.send(trunc(text, 90));
+    if (!etapa1?.productName) return res.status(400).json({ error: 'FALTAM_DADOS', field: 'productName' });
+
+    const text = await chamarLLMText(promptVariant(etapa1, kind, index, limits));
+    // Trunca no servidor (dupla proteção)
+    const maxByKind = {
+      title: limits?.titles?.max ?? 30,
+      description: limits?.descriptions?.max ?? 90,
+      sitelink_text: limits?.sitelinks?.text ?? 25,
+      sitelink_desc1: limits?.sitelinks?.desc1 ?? 35,
+      sitelink_desc2: limits?.sitelinks?.desc2 ?? 35,
+      highlight: limits?.highlights?.max ?? 25
+    }[kind] || 90;
+
+    res.type('text/plain').send(trunc(text, maxByKind));
   } catch (err) {
-    console.error(err);
+    console.error('AI_VARIANT_FAIL:', err.message);
     res.status(500).json({ error: 'AI_VARIANT_FAIL' });
   }
 });
 
+// Healthcheck simples (útil no Render)
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
 // ===== Start =====
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Servidor rodando em http://localhost:${PORT}`);
+  console.log(`✅ Servidor rodando em http://localhost:${PORT}`);
 });
