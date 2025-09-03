@@ -1,25 +1,33 @@
 // server.js
-// Requisitos: Node 18+ (fetch nativo)
+// Requisitos: Node 20+ (fetch nativo, atualizado para 2025)
 import express from 'express';
 import dotenv from 'dotenv';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import rateLimit from 'express-rate-limit';  // Adicionado para segurança
 
 // ===== Inicialização =====
-dotenv.config(); // agora lê .env
+dotenv.config(); // lê .env
 const app = express();
+app.set('trust proxy', true);  // Corrige erro de X-Forwarded-For
 app.use(express.json({ limit: '1mb' })); // evita payloads exagerados
 
+// ===== Rate Limiting (adicionado para evitar abusos) =====
+const limiter = rateLimit({
+  windowMs: process.env.RATE_LIMIT_WINDOW || 60000,  // 1 min
+  max: process.env.RATE_LIMIT_MAX || 100,  // 100 reqs por janela
+  message: 'Muitas requisições; tente novamente mais tarde.',
+});
+app.use('/api/', limiter);
+
 // ===== CORS =====
-// Use CORS_ORIGIN no .env (pode ser 1 origem ou lista separada por vírgula)
 const rawOrigins = (process.env.CORS_ORIGIN || '').trim();
 if (rawOrigins) {
   const allowed = rawOrigins.split(',').map(s => s.trim()).filter(Boolean);
   app.use(
     cors({
       origin: (origin, cb) => {
-        // Permite chamadas de ferramentas/health sem Origin e as origens na lista
         if (!origin || allowed.includes(origin)) return cb(null, true);
         return cb(new Error('Not allowed by CORS'));
       },
@@ -29,13 +37,13 @@ if (rawOrigins) {
   app.options('*', cors());
 }
 
-// ===== Static (opcional, caso queira servir /public) =====
+// ===== Static (opcional) =====
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ===== Config OpenAI (sempre via .env; nunca hardcode) =====
-const apiKey = process.env.OPENAI_API_KEY; // (não exponha no cliente)
+// ===== Config OpenAI (via .env) =====
+const apiKey = process.env.OPENAI_API_KEY;
 const MODEL_JSON = process.env.OPENAI_MODEL_JSON || 'gpt-4o-mini';
 const MODEL_TEXT = process.env.OPENAI_MODEL_TEXT || 'gpt-4o-mini';
 if (!apiKey) {
@@ -83,7 +91,7 @@ function enforceLimits(payload, limits) {
   return out;
 }
 
-// ===== Prompts =====
+// ===== Prompts (otimizados para 2025) =====
 function promptFill(etapa1, limits) {
   const {
     productName, country, language,
@@ -100,9 +108,9 @@ Gerar ativos de anúncio (títulos, descrições, sitelinks e frases destaque) p
 
 REGRAS GERAIS (SIGA À RISCA):
 - Responda SOMENTE com um JSON VÁLIDO, sem texto antes ou depois.
-- Idioma de saída: ${language} (variante local de ${country}).
+- Idioma de saída: ${language} (variante local de ${country}, ex: Português-BR para Brazil).
 - Adapte tom e vocabulário ao país/idioma.
-- Conformidade: políticas Google Ads 2025; evite promessas absolutas/enganosas; sem emojis; no máx. 1 "!" por item.
+- Conformidade: políticas Google Ads 2025; evite promessas absolutas/enganosas, "Unfair Advantage" (sem vantagens injustas), conteúdo enganoso; promova transparência em anúncios; siga ethics em AI (updates Abril/Junho 2025 sobre third-party e auto-recomendações); sem emojis; no máx. 1 "!" por item.
 - Estilo Google Ads: benefício + proposta de valor + CTA moderado.
 - Use preço/descontos quando fizer sentido:
   • Preço: ${productCurrency} ${productValue ?? 'n/a'}
@@ -141,9 +149,9 @@ function promptVariant(etapa1, kind, index, limits) {
 
   return `
 Você é um redator de Google Ads (2025). Gere APENAS UMA variação para "${kind}" (índice ${index}):
-- País: ${etapa1?.country} | Idioma: ${etapa1?.language}
+- País: ${etapa1?.country} | Idioma: ${etapa1?.language} (variante local)
 - Limite: ≤ ${limit} caracteres
-- Estilo: benefício + valor + CTA moderado; sem violar políticas Google Ads 2025; sem emojis; no máx. 1 "!"
+- Estilo: benefício + valor + CTA moderado; sem violar políticas Google Ads 2025 (sem "Unfair Advantage", transparência, ethics AI); sem emojis; no máx. 1 "!"
 - Considere preço/descontos quando fizer sentido (${etapa1?.productCurrency} ${etapa1?.productValue}; ${etapa1?.discountCurrency} ${etapa1?.monetaryDiscount} / ${etapa1?.percentageDiscount}%)
 
 Saída: SOMENTE o texto final (sem aspas e sem JSON).
@@ -151,65 +159,85 @@ Produto: ${etapa1?.productName}
 `.trim();
 }
 
-// ===== Chamada OpenAI =====
-async function chamarLLMJson(prompt) {
+// ===== Chamada OpenAI (otimizada com retry) =====
+async function chamarLLMJson(prompt, retries = 3) {
   if (!apiKey) throw new Error('OPENAI_API_KEY ausente');
-  const r = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: MODEL_JSON,
-      temperature: 0.3,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: 'Responda sempre de forma objetiva, conforme políticas Google Ads 2025.' },
-        { role: 'user', content: prompt }
-      ]
-    })
-  });
+  let attempt = 0;
+  while (attempt < retries) {
+    try {
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: MODEL_JSON,
+          temperature: 0.3,
+          max_tokens: 2000,  // Adicionado para controlar custos
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: 'Responda sempre de forma objetiva, conforme políticas Google Ads 2025.' },
+            { role: 'user', content: prompt }
+          ]
+        })
+      });
 
-  if (!r.ok) {
-    const errTxt = await r.text().catch(() => '');
-    throw new Error(`OpenAI erro: ${r.status} ${errTxt}`);
-  }
+      if (!r.ok) {
+        const errTxt = await r.text().catch(() => '');
+        throw new Error(`OpenAI erro: ${r.status} ${errTxt}`);
+      }
 
-  const data = await r.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) throw new Error('LLM sem conteúdo');
+      const data = await r.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content) throw new Error('LLM sem conteúdo');
 
-  try {
-    return JSON.parse(content);
-  } catch {
-    const match = content.match(/\{[\s\S]*\}$/);
-    if (!match) throw new Error('Resposta da IA não é JSON válido');
-    return JSON.parse(match[0]);
+      try {
+        return JSON.parse(content);
+      } catch {
+        const match = content.match(/\{[\s\S]*\}$/);
+        if (!match) throw new Error('Resposta da IA não é JSON válido');
+        return JSON.parse(match[0]);
+      }
+    } catch (err) {
+      attempt++;
+      console.error(`Retry ${attempt}/${retries} para LLMJson: ${err.message}`);
+      if (attempt === retries) throw err;
+    }
   }
 }
 
-async function chamarLLMText(prompt) {
+async function chamarLLMText(prompt, retries = 3) {
   if (!apiKey) throw new Error('OPENAI_API_KEY ausente');
-  const r = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: MODEL_TEXT,
-      temperature: 0.5,
-      messages: [
-        { role: 'system', content: 'Responda apenas com o texto pedido, sem aspas.' },
-        { role: 'user', content: prompt }
-      ]
-    })
-  });
+  let attempt = 0;
+  while (attempt < retries) {
+    try {
+      const r = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: MODEL_TEXT,
+          temperature: 0.5,
+          max_tokens: 500,  // Adicionado para controlar custos
+          messages: [
+            { role: 'system', content: 'Responda apenas com o texto pedido, sem aspas.' },
+            { role: 'user', content: prompt }
+          ]
+        })
+      });
 
-  if (!r.ok) {
-    const errTxt = await r.text().catch(() => '');
-    throw new Error(`OpenAI erro: ${r.status} ${errTxt}`);
+      if (!r.ok) {
+        const errTxt = await r.text().catch(() => '');
+        throw new Error(`OpenAI erro: ${r.status} ${errTxt}`);
+      }
+
+      const data = await r.json();
+      const content = data?.choices?.[0]?.message?.content?.trim();
+      if (!content) throw new Error('LLM sem conteúdo');
+      return content;
+    } catch (err) {
+      attempt++;
+      console.error(`Retry ${attempt}/${retries} para LLMText: ${err.message}`);
+      if (attempt === retries) throw err;
+    }
   }
-
-  const data = await r.json();
-  const content = data?.choices?.[0]?.message?.content?.trim();
-  if (!content) throw new Error('LLM sem conteúdo');
-  return content;
 }
 
 // ===== Endpoints =====
